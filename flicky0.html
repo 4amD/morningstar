@@ -1,0 +1,288 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, user-scalable=no">
+<title>Chirp Chase</title>
+<style>
+  html, body { margin: 0; height: 100%; background: #14092e; overflow: hidden; touch-action: none; }
+  #wrap { position: fixed; inset: 0; display: flex; align-items: center; justify-content: center; }
+  canvas { width: min(100vw, 177.78vh); height: auto; aspect-ratio: 16 / 9; display: block; }
+  #pad { display: none; position: fixed; left: 0; right: 0; bottom: 10px; padding: 0 14px;
+         justify-content: space-between; pointer-events: none; }
+  #pad > * { pointer-events: auto; }
+  #pad button { width: 76px; height: 76px; margin-right: 10px; border-radius: 18px; border: 2px solid rgba(255,255,255,.4);
+         background: rgba(255,255,255,.16); color: #fff; font: bold 26px "Courier New", monospace;
+         touch-action: none; user-select: none; -webkit-user-select: none; }
+  #pad button[data-k="jump"] { width: 110px; margin-right: 0; font-size: 20px; }
+  @media (pointer: coarse) { #pad { display: flex; } }
+</style>
+</head>
+<body>
+<div id="wrap"><canvas id="c"></canvas></div>
+<div id="pad">
+  <div><button data-k="left">&#9664;</button><button data-k="right">&#9654;</button></div>
+  <button data-k="jump">JUMP</button>
+</div>
+
+<script>
+(() => {
+'use strict';
+
+// ---------- setup ----------
+const W = 800, H = 450, G = 1800, MOVE = 230, JUMP = -640, STEP = 1 / 60, ROUND = 90;
+const cv = document.getElementById('c'), cx = cv.getContext('2d');
+cv.width = W; cv.height = H;
+
+// one-way platforms: x = left, y = top surface, w = width. index 0 = ground
+const PLATS = [
+  { x: 0,   y: 410, w: 800 },
+  { x: 60,  y: 320, w: 220 },
+  { x: 520, y: 320, w: 220 },
+  { x: 290, y: 230, w: 220 },
+  { x: 40,  y: 140, w: 200 },
+  { x: 560, y: 140, w: 200 }
+];
+const SPAWNS = [ { x: 160, p: 1 }, { x: 640, p: 2 }, { x: 400, p: 3 }, { x: 660, p: 5 }, { x: 720, p: 0 } ];
+const DOOR = { x: 100, y: 140, w: 36, h: 50 };
+
+let state = 'ready';            // ready | play | won | over
+let player, chicks, follow, hist, cat, timeLeft, score, delivered, hintT, msg = '';
+let lockT = 0, best = 0, jumpBuf = 0;
+try { best = +localStorage.getItem('cc_best') || 0; } catch (e) {}
+const keys = { left: false, right: false };
+
+function reset() {
+  player = { x: 400, y: 410, vx: 0, vy: 0, w: 24, h: 22, face: 1, inv: 0, stun: 0, hp: 3, onGround: true };
+  chicks = SPAWNS.map((s, i) => ({ x: s.x, y: PLATS[s.p].y - 1, vx: 0, vy: 0, w: 16, h: 14,
+    dir: i % 2 ? 1 : -1, st: 'free', cool: 0, onGround: true, plat: null }));
+  follow = []; hist = [];
+  cat = { x: 650, y: 410, vx: 0, vy: 0, w: 30, h: 24, dir: -1, onGround: true };
+  timeLeft = ROUND; score = 0; delivered = 0; hintT = 7;
+}
+
+// ---------- logic ----------
+// entity: x = centre, y = feet
+function physics(e, dt) {
+  const prev = e.y;
+  e.vy += G * dt; e.x += e.vx * dt; e.y += e.vy * dt;
+  e.x = Math.max(e.w / 2, Math.min(W - e.w / 2, e.x));
+  e.onGround = false; e.plat = null;
+  if (e.vy >= 0) {
+    for (const pl of PLATS) {
+      if (e.x + e.w / 2 > pl.x && e.x - e.w / 2 < pl.x + pl.w && prev <= pl.y + 1 && e.y >= pl.y) {
+        e.y = pl.y; e.vy = 0; e.onGround = true; e.plat = pl; break;
+      }
+    }
+  }
+}
+function overlap(a, b) {
+  return Math.abs(a.x - b.x) < (a.w + b.w) / 2 && a.y > b.y - b.h && a.y - a.h < b.y;
+}
+function finish(win, text) {
+  state = win ? 'won' : 'over'; msg = text; lockT = 0.6;
+  if (score > best) { best = score; try { localStorage.setItem('cc_best', best); } catch (e) {} }
+}
+
+function step(dt) {
+  if (state !== 'play') return;
+  const p = player;
+  hintT -= dt; timeLeft -= dt;
+  if (timeLeft <= 0) { timeLeft = 0; finish(false, "TIME'S UP"); return; }
+
+  // player
+  const ax = (keys.right ? 1 : 0) - (keys.left ? 1 : 0);
+  if (p.stun <= 0) { p.vx = ax * MOVE; if (ax) p.face = ax; }
+  jumpBuf -= dt;
+  if (jumpBuf > 0 && p.onGround && p.stun <= 0) { p.vy = JUMP; jumpBuf = 0; }
+  p.stun -= dt; p.inv -= dt;
+  physics(p, dt);
+  hist.push({ x: p.x, y: p.y }); if (hist.length > 400) hist.shift();
+
+  // chicks
+  for (const c of chicks) {
+    if (c.st !== 'free') continue;
+    c.cool -= dt;
+    c.vx = c.dir * 35;
+    physics(c, dt);
+    if (c.plat) {
+      if (c.x < c.plat.x + 10) c.dir = 1;
+      else if (c.x > c.plat.x + c.plat.w - 10) c.dir = -1;
+    }
+    if (c.cool <= 0 && overlap(p, c)) { c.st = 'follow'; follow.push(c); }
+  }
+  follow.forEach((c, i) => {
+    const h = hist[Math.max(0, hist.length - 1 - (i + 1) * 9)];
+    c.x = h.x; c.y = h.y; c.dir = p.face;
+  });
+
+  // cat
+  const chase = p.y > 340 && Math.abs(p.x - cat.x) < 420;
+  if (chase) cat.dir = p.x > cat.x ? 1 : -1;
+  else { if (cat.x < 40) cat.dir = 1; if (cat.x > 760) cat.dir = -1; }
+  cat.vx = cat.dir * (chase ? 125 : 70);
+  physics(cat, dt);
+
+  if (p.inv <= 0 && overlap(p, cat)) {
+    p.hp--; p.inv = 1.6; p.stun = 0.25; p.vy = -380; p.vx = (p.x < cat.x ? -1 : 1) * 200;
+    follow.forEach(c => { c.st = 'free'; c.vy = -250; c.vx = 0; c.cool = 1.2; c.dir = Math.random() < 0.5 ? -1 : 1; });
+    follow = [];
+    if (p.hp <= 0) { finish(false, 'THE CAT GOT YOU'); return; }
+  }
+
+  // exit door
+  if (follow.length && Math.abs(p.x - DOOR.x) < DOOR.w / 2 + 8 && p.y > DOOR.y - DOOR.h && p.y <= DOOR.y + 6) {
+    const n = follow.length;
+    delivered += n; score += n * n * 100;           // bring more at once = bigger score
+    follow.forEach(c => { c.st = 'done'; });
+    follow = []; chicks = chicks.filter(c => c.st !== 'done');
+    if (delivered >= SPAWNS.length) { score += Math.ceil(timeLeft) * 10; finish(true, 'ALL CHICKS SAFE!'); }
+  }
+}
+
+// ---------- input ----------
+function start() {
+  if (state === 'ready' || ((state === 'won' || state === 'over') && lockT <= 0)) { reset(); state = 'play'; }
+}
+const KM = { ArrowLeft: 'left', KeyA: 'left', ArrowRight: 'right', KeyD: 'right' };
+const JK = new Set(['ArrowUp', 'KeyW', 'Space']);
+addEventListener('keydown', e => {
+  if (KM[e.code] || JK.has(e.code)) e.preventDefault();
+  if (e.repeat) return;
+  if (KM[e.code]) keys[KM[e.code]] = true;
+  if (JK.has(e.code)) jumpBuf = 0.12;
+  if (state !== 'play') start();
+});
+addEventListener('keyup', e => { if (KM[e.code]) keys[KM[e.code]] = false; });
+addEventListener('blur', () => { keys.left = keys.right = false; });
+document.querySelectorAll('#pad button').forEach(b => {
+  const k = b.dataset.k;
+  const on = e => { e.preventDefault(); if (k === 'jump') jumpBuf = 0.12; else keys[k] = true; if (state !== 'play') start(); };
+  const off = e => { e.preventDefault(); if (k !== 'jump') keys[k] = false; };
+  b.addEventListener('pointerdown', on);
+  ['pointerup', 'pointerleave', 'pointercancel'].forEach(t => b.addEventListener(t, off));
+});
+cv.addEventListener('pointerdown', () => { if (state !== 'play') start(); });
+
+// ---------- drawing (flat-shaded polygons = low-poly look) ----------
+function poly(pts, col) {
+  cx.fillStyle = col; cx.beginPath(); cx.moveTo(pts[0][0], pts[0][1]);
+  for (let i = 1; i < pts.length; i++) cx.lineTo(pts[i][0], pts[i][1]);
+  cx.closePath(); cx.fill();
+}
+function txt(s, x, y, size, col, align) {
+  cx.font = 'bold ' + size + 'px "Courier New", monospace'; cx.textAlign = align || 'center';
+  cx.fillStyle = '#12082a'; cx.fillText(s, x + 2, y + 2);
+  cx.fillStyle = col; cx.fillText(s, x, y);
+}
+function at(e, flip, fn) { cx.save(); cx.translate(Math.round(e.x), Math.round(e.y)); cx.scale(flip, 1); fn(); cx.restore(); }
+
+// pre-rendered background: sunset, sun, two mountain layers
+const bg = document.createElement('canvas'); bg.width = W; bg.height = H;
+(() => {
+  const g = bg.getContext('2d');
+  const sky = g.createLinearGradient(0, 0, 0, H);
+  sky.addColorStop(0, '#2b1b5e'); sky.addColorStop(0.6, '#c2467a'); sky.addColorStop(1, '#ff9a4a');
+  g.fillStyle = sky; g.fillRect(0, 0, W, H);
+  g.fillStyle = '#ffd36b'; g.beginPath();
+  for (let i = 0; i < 8; i++) { const a = i * Math.PI / 4 + Math.PI / 8; g.lineTo(620 + Math.cos(a) * 60, 250 + Math.sin(a) * 60); }
+  g.closePath(); g.fill();
+  [['#4a2a7a', 300, 80, 3], ['#33205f', 360, 60, 11]].forEach(([col, base, amp, seed]) => {
+    g.fillStyle = col; g.beginPath(); g.moveTo(0, H);
+    let s = seed; for (let x = 0; x <= W + 80; x += 80) { s = (s * 9301 + 49297) % 233280; g.lineTo(x, base - (s / 233280) * amp); }
+    g.lineTo(W, H); g.closePath(); g.fill();
+  });
+})();
+
+function drawPlat(pl, i) {
+  if (i === 0) {
+    poly([[0, pl.y], [W, pl.y], [W, H], [0, H]], '#2a2350');
+    for (let x = 0; x < W; x += 100) poly([[x, pl.y + 10], [x + 50, pl.y + 10], [x + 25, H]], '#322a5e');
+    poly([[0, pl.y], [W, pl.y], [W, pl.y + 10], [0, pl.y + 10]], '#5ee08a');
+    return;
+  }
+  poly([[pl.x, pl.y], [pl.x + pl.w, pl.y], [pl.x + pl.w, pl.y + 10], [pl.x, pl.y + 10]], '#5ee08a');
+  poly([[pl.x, pl.y + 10], [pl.x + pl.w, pl.y + 10], [pl.x + pl.w - 14, pl.y + 28], [pl.x + 14, pl.y + 28]], '#35a863');
+  poly([[pl.x + 14, pl.y + 28], [pl.x + pl.w - 14, pl.y + 28], [pl.x + pl.w / 2, pl.y + 40]], '#237a49');
+}
+function drawDoor(t) {
+  const d = DOOR, x = d.x - d.w / 2, y = d.y - d.h;
+  const lit = follow.length && Math.sin(t * 8) > 0;
+  poly([[x, d.y], [x, y + 12], [x + d.w / 2, y], [x + d.w, y + 12], [x + d.w, d.y]], lit ? '#c9a4ff' : '#8a4fff');
+  poly([[x + 6, d.y], [x + 6, y + 16], [x + d.w / 2, y + 8], [x + d.w - 6, y + 16], [x + d.w - 6, d.y]], '#2b1b5e');
+  txt('EXIT', d.x, y - 6, 14, '#fff3a0');
+}
+function drawBird() {
+  const up = !player.onGround;
+  poly([[-12, -10], [-4, -22], [8, -20], [13, -12], [8, -2], [-6, 0]], '#3a7bff');
+  poly([[-6, 0], [8, -2], [13, -12], [3, -8], [-7, -7]], '#7dbcff');
+  poly(up ? [[-12, -12], [-4, -27], [0, -14]] : [[-12, -10], [-2, -14], [-7, -3]], '#1f4fc0');
+  poly([[12, -16], [20, -12], [12, -9]], '#ffb020');
+  cx.fillStyle = '#fff'; cx.fillRect(5, -17, 4, 4); cx.fillStyle = '#111'; cx.fillRect(7, -16, 2, 2);
+  cx.fillStyle = '#ff8a00'; cx.fillRect(-4, -2, 2, 3); cx.fillRect(3, -2, 2, 3);
+}
+function drawChick() {
+  poly([[-8, 0], [-8, -7], [-3, -14], [4, -14], [8, -8], [8, 0]], '#ffd23a');
+  poly([[-8, 0], [-8, -7], [0, -6], [0, 0]], '#f2a900');
+  poly([[8, -10], [13, -8], [8, -6]], '#ff7a00');
+  cx.fillStyle = '#111'; cx.fillRect(3, -11, 2, 2);
+}
+function drawCat() {
+  poly([[-15, 0], [-15, -12], [-9, -19], [9, -19], [15, -12], [15, 0]], '#ff7a3a');
+  poly([[-15, 0], [-15, -12], [-4, -10], [-4, 0]], '#d9561f');
+  poly([[-13, -18], [-9, -27], [-4, -18]], '#ff7a3a');
+  poly([[4, -18], [9, -27], [13, -18]], '#ff7a3a');
+  poly([[-15, -6], [-25, -15], [-21, -4]], '#d9561f');
+  cx.fillStyle = '#fff3a0'; cx.fillRect(4, -15, 5, 3); cx.fillRect(-3, -15, 5, 3);
+  cx.fillStyle = '#111'; cx.fillRect(6, -15, 2, 3); cx.fillRect(-1, -15, 2, 3);
+}
+function drawHUD() {
+  for (let i = 0; i < 3; i++) {
+    const x = 20 + i * 26;
+    poly([[x, 22], [x + 10, 10], [x + 20, 22], [x + 10, 34]], i < player.hp ? '#ff4d6d' : '#4a2a5a');
+  }
+  txt('SAVED ' + delivered + '/' + SPAWNS.length, W / 2, 30, 20, '#fff3a0');
+  txt('TIME ' + Math.ceil(timeLeft), W - 20, 30, 20, timeLeft < 15 ? '#ff6b6b' : '#fff3a0', 'right');
+  txt('SCORE ' + score, W - 20, 54, 14, '#ffffff', 'right');
+  if (state === 'play' && hintT > 0) txt('GRAB CHICKS  >  RUN TO EXIT  >  DODGE CAT', W / 2, 436, 15, '#ffffff');
+}
+function overlay(t, lines, prompt) {
+  cx.fillStyle = 'rgba(20,9,46,.72)'; cx.fillRect(0, 0, W, H);
+  txt(lines.title, W / 2, 150, 54, '#ffd23a');
+  lines.rows.forEach((r, i) => txt(r, W / 2, 205 + i * 30, 20, '#ffffff'));
+  if (Math.sin(t * 5) > -0.3) txt(prompt, W / 2, 390, 20, '#7dbcff');
+}
+
+function draw(t) {
+  cx.drawImage(bg, 0, 0);
+  drawDoor(t);
+  PLATS.forEach(drawPlat);
+  chicks.filter(c => c.st === 'free').forEach(c => at(c, c.dir, drawChick));
+  chicks.filter(c => c.st === 'follow').forEach(c => at(c, c.dir, drawChick));
+  at(cat, cat.dir, drawCat);
+  if (!(player.inv > 0 && Math.floor(t * 12) % 2)) at(player, player.face, drawBird);
+  drawHUD();
+  if (state === 'ready') {
+    overlay(t, { title: 'CHIRP CHASE', rows: ['GRAB THE LOST CHICKS', 'LEAD THEM TO THE EXIT', 'DODGE THE CAT', '', 'ARROWS / WASD MOVE    SPACE JUMP'] },
+      'PRESS ANY KEY OR TAP TO START');
+  } else if (state === 'won' || state === 'over') {
+    overlay(t, { title: msg, rows: ['SCORE ' + score, 'BEST ' + best] },
+      lockT > 0 ? '' : 'PRESS ANY KEY OR TAP TO PLAY AGAIN');
+  }
+}
+
+// ---------- main loop ----------
+let last = 0, acc = 0;
+function loop(ts) {
+  const dt = Math.min(0.1, (ts - last) / 1000 || 0); last = ts;
+  acc += dt; while (acc >= STEP) { step(STEP); acc -= STEP; }
+  lockT = Math.max(0, lockT - dt);
+  draw(ts / 1000);
+  requestAnimationFrame(loop);
+}
+reset();
+requestAnimationFrame(loop);
+})();
+</script>
+</body>
+</html>
