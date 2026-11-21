@@ -1,0 +1,426 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, user-scalable=no">
+<title>Chirp Chase</title>
+<style>
+  html, body { margin: 0; height: 100%; background: #14092e; overflow: hidden; touch-action: none; }
+  #wrap { position: fixed; inset: 0; display: flex; align-items: center; justify-content: center; }
+  canvas { width: min(100vw, 177.78vh); height: auto; aspect-ratio: 16 / 9; display: block; }
+  #pad { display: none; position: fixed; left: 0; right: 0; bottom: 10px; padding: 0 14px;
+         justify-content: space-between; pointer-events: none; }
+  #pad > * { pointer-events: auto; }
+  #pad button { width: 76px; height: 76px; margin-right: 10px; border-radius: 18px; border: 2px solid rgba(255,255,255,.4);
+         background: rgba(255,255,255,.16); color: #fff; font: bold 26px "Courier New", monospace;
+         touch-action: none; user-select: none; -webkit-user-select: none; }
+  #pad button[data-k="jump"] { width: 110px; margin-right: 0; font-size: 20px; }
+  @media (pointer: coarse) { #pad { display: flex; } }
+</style>
+</head>
+<body>
+<div id="wrap"><canvas id="c"></canvas></div>
+<div id="pad">
+  <div><button data-k="left">&#9664;</button><button data-k="right">&#9654;</button></div>
+  <button data-k="jump">JUMP</button>
+</div>
+
+<script>
+(() => {
+'use strict';
+
+// ---------- setup ----------
+const VW = 800, VH = 450, WW = 1600;          // view size, world width
+const G = 1800, MOVE = 230, JUMP = -640, STEP = 1 / 60, ROUND = 120;
+const CAT_JUMP = -650, CAT_AIR = 150, ROAM = 70, CHASE = 165;
+const cv = document.getElementById('c'), cx = cv.getContext('2d');
+cv.width = VW; cv.height = VH;
+
+// one-way platforms: x = left, y = top surface, w = width. index 0 = ground
+const PLATS = [{ x: 0, y: 410, w: WW }];
+[[320, [[40,180],[300,200],[580,180],[860,200],[1140,180],[1400,160]]],
+ [230, [[170,180],[450,200],[730,180],[1010,200],[1290,200]]],
+ [140, [[40,200],[330,180],[620,200],[900,180],[1180,200],[1440,140]]]]
+  .forEach(([y, row]) => row.forEach(([x, w]) => PLATS.push({ x, y, w })));
+PLATS.forEach((p, i) => { p.i = i; });
+// chicks stand on these platforms (index into PLATS)
+const SPAWN_PLATS = [3, 6, 9, 11, 15, 0];
+const DOOR = { x: 100, y: 140, w: 36, h: 50 };
+
+// ---------- cat navigation map ----------
+// For each pair of platforms: can a cat get from A to B, and where does it launch from?
+function gapOf(A, B) { return Math.max(0, Math.max(A.x, B.x) - Math.min(A.x + A.w, B.x + B.w)); }
+function edgeOpts(A, B) {
+  const g = gapOf(A, B), dy = B.y - A.y, opts = [];
+  if (dy < -100) return null;
+  if (dy < 5) {                                   // same level or up: jump
+    if (Math.abs(dy) < 5 && g === 0) return null;
+    if (dy < -5 && g === 0) {
+      const mid = (Math.max(A.x, B.x) + Math.min(A.x + A.w, B.x + B.w)) / 2;
+      const lx = Math.max(A.x + 10, Math.min(A.x + A.w - 10, mid));
+      const bc = B.x + B.w / 2;
+      opts.push({ x: lx, dir: Math.abs(bc - lx) < 20 ? 0 : Math.sign(bc - lx), act: 'jump' });
+    } else if (g <= (dy < -5 ? 50 : 90)) {
+      const right = B.x > A.x;
+      opts.push({ x: right ? A.x + A.w - 8 : A.x + 8, dir: right ? 1 : -1, act: 'jump' });
+    }
+  } else {                                        // down: walk off an edge
+    const drift = Math.sqrt(2 * dy / G) * ROAM;
+    if (B.x < A.x - 15 && (B.x + B.w >= A.x || g <= drift - 5)) opts.push({ x: A.x + 6, dir: -1, act: 'walk' });
+    if (B.x + B.w > A.x + A.w + 15 && (B.x <= A.x + A.w || g <= drift - 5)) opts.push({ x: A.x + A.w - 6, dir: 1, act: 'walk' });
+  }
+  return opts.length ? opts : null;
+}
+const NAV = (() => {
+  const n = PLATS.length;
+  const edges = Array.from({ length: n }, () => Array(n).fill(null));
+  const next = Array.from({ length: n }, () => Array(n).fill(-1));
+  for (let a = 0; a < n; a++) for (let b = 0; b < n; b++) if (a !== b) edges[a][b] = edgeOpts(PLATS[a], PLATS[b]);
+  for (let s = 0; s < n; s++) {                   // breadth-first search: first hop towards every platform
+    const seen = Array(n).fill(false), q = [];
+    seen[s] = true;
+    for (let v = 0; v < n; v++) if (edges[s][v]) { seen[v] = true; next[s][v] = v; q.push(v); }
+    while (q.length) {
+      const u = q.shift();
+      for (let v = 0; v < n; v++) if (!seen[v] && edges[u][v]) { seen[v] = true; next[s][v] = next[s][u]; q.push(v); }
+    }
+  }
+  return { edges, next };
+})();
+
+// ---------- state ----------
+let state = 'ready';            // ready | play | won | over
+let player, chicks, follow, hist, cats, spawnT, timeLeft, score, delivered, hintT, camX = 0, msg = '';
+let lockT = 0, best = 0, jumpBuf = 0;
+try { best = +localStorage.getItem('cc_best') || 0; } catch (e) {}
+const keys = { left: false, right: false };
+
+function reset() {
+  player = { x: 400, y: 410, vx: 0, vy: 0, w: 24, h: 22, face: 1, inv: 0, stun: 0, hp: 3, onGround: true, lastPlat: 0 };
+  chicks = SPAWN_PLATS.map((pi, i) => {
+    const pl = PLATS[pi];
+    return { x: pi === 0 ? 1500 : pl.x + pl.w / 2, y: pl.y - 1, vx: 0, vy: 0, w: 16, h: 14,
+      dir: i % 2 ? 1 : -1, st: 'free', cool: 0, onGround: true, plat: null };
+  });
+  follow = []; hist = []; cats = [];
+  spawnT = [5 + Math.random() * 5, 35, 70];       // seconds into the round when each cat appears
+  timeLeft = ROUND; score = 0; delivered = 0; hintT = 7;
+  camX = camTarget();
+}
+function camTarget() { return Math.max(0, Math.min(WW - VW, player.x - VW / 2)); }
+
+// ---------- logic ----------
+// entity: x = centre, y = feet
+function physics(e, dt) {
+  const prev = e.y;
+  e.vy += G * dt; e.x += e.vx * dt; e.y += e.vy * dt;
+  e.x = Math.max(e.w / 2, Math.min(WW - e.w / 2, e.x));
+  e.onGround = false; e.plat = null;
+  if (e.vy >= 0) {
+    for (const pl of PLATS) {
+      if (e.x + e.w / 2 > pl.x && e.x - e.w / 2 < pl.x + pl.w && prev <= pl.y + 1 && e.y >= pl.y) {
+        e.y = pl.y; e.vy = 0; e.onGround = true; e.plat = pl; break;
+      }
+    }
+  }
+}
+function overlap(a, b) {
+  return Math.abs(a.x - b.x) < (a.w + b.w) / 2 && a.y > b.y - b.h && a.y - a.h < b.y;
+}
+function finish(win, text) {
+  state = win ? 'won' : 'over'; msg = text; lockT = 0.6;
+  if (score > best) { best = score; try { localStorage.setItem('cc_best', best); } catch (e) {} }
+}
+
+// ----- cats -----
+function pickRoam(c) {
+  c.roamPlat = Math.floor(Math.random() * PLATS.length);
+  const pl = PLATS[c.roamPlat];
+  c.roamX = pl.x + 14 + Math.random() * (pl.w - 28);
+}
+function addCat() {
+  const c = { x: player.x < WW / 2 ? WW - 40 : 40, y: 410, vx: 0, vy: 0, w: 30, h: 24, dir: -1,
+    onGround: false, plat: null, mode: 'roam', cd: 0, alert: 0, wait: 0, roamPlat: 0, roamX: 0 };
+  pickRoam(c); cats.push(c);
+}
+// walk / jump / drop towards a goal platform and x
+function navigate(c, goalPlat, goalX, speed) {
+  const here = c.plat.i;
+  if (here === goalPlat) { c.vx = Math.abs(goalX - c.x) < 6 ? 0 : Math.sign(goalX - c.x) * speed; return; }
+  const hop = NAV.next[here][goalPlat];
+  if (hop < 0) { c.vx = c.dir * speed * 0.5; if (c.x < 40) c.dir = 1; if (c.x > WW - 40) c.dir = -1; return; }
+  const opts = NAV.edges[here][hop];
+  let best = opts[0];
+  for (const o of opts) if (Math.abs(o.x - c.x) < Math.abs(best.x - c.x)) best = o;
+  if (best.act === 'walk') {
+    const there = best.dir < 0 ? c.x <= best.x + 6 : c.x >= best.x - 6;
+    c.vx = there ? best.dir * speed : Math.sign(best.x - c.x) * speed;
+    return;
+  }
+  const dx = best.x - c.x;
+  if (Math.abs(dx) > 6) { c.vx = Math.sign(dx) * speed; return; }
+  c.vy = CAT_JUMP; c.vx = best.dir * CAT_AIR;     // at the launch point: jump
+}
+function updateCat(c, dt) {
+  const p = player;
+  c.cd -= dt; c.alert -= dt;
+  const d = Math.hypot(p.x - c.x, p.y - c.y);
+  if (c.mode === 'roam' && c.cd <= 0 && d < 300) { c.mode = 'chase'; c.alert = 0.9; }
+  else if (c.mode === 'chase' && (d > 480 || c.cd > 0)) c.mode = 'roam';
+  if (c.onGround && c.plat) {
+    if (c.mode === 'chase') navigate(c, p.lastPlat, p.x, CHASE);
+    else if (c.wait > 0) { c.wait -= dt; c.vx = 0; }
+    else if (c.plat.i === c.roamPlat && Math.abs(c.x - c.roamX) < 8) { c.wait = 0.5 + Math.random() * 1.2; pickRoam(c); c.vx = 0; }
+    else navigate(c, c.roamPlat, c.roamX, ROAM);
+    if (c.vx) c.dir = c.vx > 0 ? 1 : -1;
+  }
+  physics(c, dt);
+}
+
+function step(dt) {
+  if (state !== 'play') return;
+  const p = player;
+  hintT -= dt; timeLeft -= dt;
+  if (timeLeft <= 0) { timeLeft = 0; finish(false, "TIME'S UP"); return; }
+
+  // player (slower with more chicks in tow)
+  const ax = (keys.right ? 1 : 0) - (keys.left ? 1 : 0);
+  const spd = MOVE * Math.max(0.75, 1 - 0.05 * follow.length);
+  if (p.stun <= 0) { p.vx = ax * spd; if (ax) p.face = ax; }
+  jumpBuf -= dt;
+  if (jumpBuf > 0 && p.onGround && p.stun <= 0) { p.vy = JUMP; jumpBuf = 0; }
+  p.stun -= dt; p.inv -= dt;
+  physics(p, dt);
+  if (p.plat) p.lastPlat = p.plat.i;
+  hist.push({ x: p.x, y: p.y }); if (hist.length > 400) hist.shift();
+  camX += (camTarget() - camX) * Math.min(1, dt * 8);
+
+  // chicks
+  for (const c of chicks) {
+    if (c.st !== 'free') continue;
+    c.cool -= dt;
+    c.vx = c.dir * 35;
+    physics(c, dt);
+    if (c.plat) {
+      if (c.x < c.plat.x + 10) c.dir = 1;
+      else if (c.x > c.plat.x + c.plat.w - 10) c.dir = -1;
+    }
+    if (c.cool <= 0 && overlap(p, c)) { c.st = 'follow'; follow.push(c); }
+  }
+  follow.forEach((c, i) => {
+    const h = hist[Math.max(0, hist.length - 1 - (i + 1) * 9)];
+    c.x = h.x; c.y = h.y; c.dir = p.face;
+  });
+
+  // cats appear on a timer, roam, then hunt when the bird gets close
+  const elapsed = ROUND - timeLeft;
+  while (cats.length < spawnT.length && elapsed >= spawnT[cats.length]) addCat();
+  for (const c of cats) {
+    updateCat(c, dt);
+    if (p.inv <= 0 && overlap(p, c)) {
+      p.hp--; p.inv = 1.6; p.stun = 0.25; p.vy = -380; p.vx = (p.x < c.x ? -1 : 1) * 200;
+      c.cd = 2; c.mode = 'roam';
+      follow.forEach(f => { f.st = 'free'; f.vy = -250; f.vx = 0; f.cool = 1.2; f.dir = Math.random() < 0.5 ? -1 : 1; });
+      follow = [];
+      if (p.hp <= 0) { finish(false, 'THE CAT GOT YOU'); return; }
+    }
+  }
+
+  // exit door
+  if (follow.length && Math.abs(p.x - DOOR.x) < DOOR.w / 2 + 8 && p.y > DOOR.y - DOOR.h && p.y <= DOOR.y + 6) {
+    const n = follow.length;
+    delivered += n; score += n * n * 100;           // bring more at once = bigger score
+    follow.forEach(c => { c.st = 'done'; });
+    follow = []; chicks = chicks.filter(c => c.st !== 'done');
+    if (delivered >= SPAWN_PLATS.length) { score += Math.ceil(timeLeft) * 10; finish(true, 'ALL CHICKS SAFE!'); }
+  }
+}
+
+// ---------- input ----------
+function start() {
+  if (state === 'ready' || ((state === 'won' || state === 'over') && lockT <= 0)) { reset(); state = 'play'; }
+}
+const KM = { ArrowLeft: 'left', KeyA: 'left', ArrowRight: 'right', KeyD: 'right' };
+const JK = new Set(['ArrowUp', 'KeyW', 'Space']);
+addEventListener('keydown', e => {
+  if (KM[e.code] || JK.has(e.code)) e.preventDefault();
+  if (e.repeat) return;
+  if (KM[e.code]) keys[KM[e.code]] = true;
+  if (JK.has(e.code)) jumpBuf = 0.12;
+  if (state !== 'play') start();
+});
+addEventListener('keyup', e => { if (KM[e.code]) keys[KM[e.code]] = false; });
+addEventListener('blur', () => { keys.left = keys.right = false; });
+document.querySelectorAll('#pad button').forEach(b => {
+  const k = b.dataset.k;
+  const on = e => { e.preventDefault(); if (k === 'jump') jumpBuf = 0.12; else keys[k] = true; if (state !== 'play') start(); };
+  const off = e => { e.preventDefault(); if (k !== 'jump') keys[k] = false; };
+  b.addEventListener('pointerdown', on);
+  ['pointerup', 'pointerleave', 'pointercancel'].forEach(t => b.addEventListener(t, off));
+});
+cv.addEventListener('pointerdown', () => { if (state !== 'play') start(); });
+
+// ---------- drawing (flat-shaded polygons = low-poly look) ----------
+function poly(pts, col) {
+  cx.fillStyle = col; cx.beginPath(); cx.moveTo(pts[0][0], pts[0][1]);
+  for (let i = 1; i < pts.length; i++) cx.lineTo(pts[i][0], pts[i][1]);
+  cx.closePath(); cx.fill();
+}
+function txt(s, x, y, size, col, align) {
+  cx.font = 'bold ' + size + 'px "Courier New", monospace'; cx.textAlign = align || 'center';
+  cx.fillStyle = '#12082a'; cx.fillText(s, x + 2, y + 2);
+  cx.fillStyle = col; cx.fillText(s, x, y);
+}
+function at(e, flip, fn) { cx.save(); cx.translate(Math.round(e.x), Math.round(e.y)); cx.scale(flip, 1); fn(); cx.restore(); }
+
+// pre-rendered room wall: faceted wallpaper, sunset windows, curtains, pictures, wainscot
+const bg = document.createElement('canvas'); bg.width = WW; bg.height = VH;
+(() => {
+  const g = bg.getContext('2d');
+  const P = (pts, col) => { g.fillStyle = col; g.beginPath(); g.moveTo(pts[0][0], pts[0][1]);
+    for (let i = 1; i < pts.length; i++) g.lineTo(pts[i][0], pts[i][1]); g.closePath(); g.fill(); };
+  g.fillStyle = '#4b2a5e'; g.fillRect(0, 0, WW, VH);
+  for (let x = 0; x < WW; x += 80) for (let y = 0; y < VH; y += 80) {
+    P([[x, y + 40], [x + 40, y], [x + 40, y + 40]], '#583272');
+    P([[x + 40, y], [x + 80, y + 40], [x + 40, y + 40]], '#41234f');
+    P([[x, y + 40], [x + 40, y + 80], [x + 40, y + 40]], '#41234f');
+    P([[x + 40, y + 40], [x + 80, y + 40], [x + 40, y + 80]], '#583272');
+    g.fillStyle = '#e8b04a'; g.fillRect(x + 38, y + 38, 4, 4);
+  }
+  // wainscot band
+  P([[0, 345], [WW, 345], [WW, 410], [0, 410]], '#2c1640');
+  P([[0, 341], [WW, 341], [WW, 347], [0, 347]], '#e8b04a');
+  for (let x = 20; x < WW; x += 120) P([[x, 355], [x + 80, 355], [x + 70, 402], [x + 10, 402]], '#3a2150');
+  // windows with curtains
+  [230, 700, 1170, 1450].forEach(wx => {
+    const y = 60;
+    P([[wx, y + 170], [wx, y + 30], [wx + 20, y + 8], [wx + 90, y + 8], [wx + 110, y + 30], [wx + 110, y + 170]], '#f4d9a6');
+    const sky = g.createLinearGradient(0, y + 16, 0, y + 162);
+    sky.addColorStop(0, '#ffb86b'); sky.addColorStop(0.6, '#ff6f91'); sky.addColorStop(1, '#8a4fff');
+    g.fillStyle = sky; g.beginPath();
+    g.moveTo(wx + 8, y + 162); g.lineTo(wx + 8, y + 34); g.lineTo(wx + 24, y + 16); g.lineTo(wx + 86, y + 16);
+    g.lineTo(wx + 102, y + 34); g.lineTo(wx + 102, y + 162); g.closePath(); g.fill();
+    P([[wx + 8, y + 162], [wx + 40, y + 120], [wx + 70, y + 162]], '#33205f');
+    P([[wx + 50, y + 162], [wx + 80, y + 130], [wx + 102, y + 162]], '#41234f');
+    g.fillStyle = '#f4d9a6'; g.fillRect(wx + 52, y + 16, 6, 146); g.fillRect(wx + 8, y + 86, 94, 6);
+    P([[wx - 16, y], [wx + 18, y], [wx + 6, y + 190], [wx - 16, y + 190]], '#c2467a');
+    P([[wx + 92, y], [wx + 126, y], [wx + 126, y + 190], [wx + 104, y + 190]], '#c2467a');
+    P([[wx - 16, y], [wx + 2, y], [wx - 6, y + 190], [wx - 16, y + 190]], '#9c2f60');
+  });
+  // framed pictures
+  [470, 940, 1380].forEach(px => {
+    P([[px, 210], [px + 64, 210], [px + 64, 258], [px, 258]], '#e8b04a');
+    P([[px + 5, 215], [px + 59, 215], [px + 59, 253], [px + 5, 253]], '#2b1b5e');
+    P([[px + 5, 253], [px + 24, 226], [px + 38, 253]], '#c2467a');
+    P([[px + 30, 253], [px + 46, 232], [px + 59, 253]], '#8a4fff');
+  });
+})();
+
+function drawPlat(pl, i) {
+  if (i === 0) {
+    poly([[0, pl.y], [WW, pl.y], [WW, VH], [0, VH]], '#3a2447');
+    for (let x = 0; x < WW; x += 100) poly([[x, pl.y + 10], [x + 50, pl.y + 10], [x + 25, VH]], '#4a2f5a');
+    poly([[0, pl.y], [WW, pl.y], [WW, pl.y + 10], [0, pl.y + 10]], '#5ee08a');
+    return;
+  }
+  poly([[pl.x, pl.y], [pl.x + pl.w, pl.y], [pl.x + pl.w, pl.y + 10], [pl.x, pl.y + 10]], '#5ee08a');
+  poly([[pl.x, pl.y + 10], [pl.x + pl.w, pl.y + 10], [pl.x + pl.w - 14, pl.y + 28], [pl.x + 14, pl.y + 28]], '#35a863');
+  poly([[pl.x + 14, pl.y + 28], [pl.x + pl.w - 14, pl.y + 28], [pl.x + pl.w / 2, pl.y + 40]], '#237a49');
+}
+function drawDoor(t) {
+  const d = DOOR, x = d.x - d.w / 2, y = d.y - d.h;
+  const lit = follow.length && Math.sin(t * 8) > 0;
+  poly([[x, d.y], [x, y + 12], [x + d.w / 2, y], [x + d.w, y + 12], [x + d.w, d.y]], lit ? '#c9a4ff' : '#8a4fff');
+  poly([[x + 6, d.y], [x + 6, y + 16], [x + d.w / 2, y + 8], [x + d.w - 6, y + 16], [x + d.w - 6, d.y]], '#2b1b5e');
+  txt('EXIT', d.x, y - 6, 14, '#fff3a0');
+}
+function drawBird() {
+  const up = !player.onGround;
+  poly([[-12, -10], [-4, -22], [8, -20], [13, -12], [8, -2], [-6, 0]], '#3a7bff');
+  poly([[-6, 0], [8, -2], [13, -12], [3, -8], [-7, -7]], '#7dbcff');
+  poly(up ? [[-12, -12], [-4, -27], [0, -14]] : [[-12, -10], [-2, -14], [-7, -3]], '#1f4fc0');
+  poly([[12, -16], [20, -12], [12, -9]], '#ffb020');
+  cx.fillStyle = '#fff'; cx.fillRect(5, -17, 4, 4); cx.fillStyle = '#111'; cx.fillRect(7, -16, 2, 2);
+  cx.fillStyle = '#ff8a00'; cx.fillRect(-4, -2, 2, 3); cx.fillRect(3, -2, 2, 3);
+}
+function drawChick() {
+  poly([[-8, 0], [-8, -7], [-3, -14], [4, -14], [8, -8], [8, 0]], '#ffd23a');
+  poly([[-8, 0], [-8, -7], [0, -6], [0, 0]], '#f2a900');
+  poly([[8, -10], [13, -8], [8, -6]], '#ff7a00');
+  cx.fillStyle = '#111'; cx.fillRect(3, -11, 2, 2);
+}
+function drawCat() {
+  poly([[-15, 0], [-15, -12], [-9, -19], [9, -19], [15, -12], [15, 0]], '#ff7a3a');
+  poly([[-15, 0], [-15, -12], [-4, -10], [-4, 0]], '#d9561f');
+  poly([[-13, -18], [-9, -27], [-4, -18]], '#ff7a3a');
+  poly([[4, -18], [9, -27], [13, -18]], '#ff7a3a');
+  poly([[-15, -6], [-25, -15], [-21, -4]], '#d9561f');
+  cx.fillStyle = '#fff3a0'; cx.fillRect(4, -15, 5, 3); cx.fillRect(-3, -15, 5, 3);
+  cx.fillStyle = '#111'; cx.fillRect(6, -15, 2, 3); cx.fillRect(-1, -15, 2, 3);
+}
+function drawRadar() {
+  const x0 = 300, y0 = 42, w = 200, h = 10, s = w / WW;
+  cx.fillStyle = 'rgba(18,8,42,.65)'; cx.fillRect(x0, y0, w, h);
+  cx.fillStyle = '#8a4fff'; cx.fillRect(x0 + DOOR.x * s - 2, y0, 4, h);
+  cx.fillStyle = '#ffd23a'; chicks.forEach(c => { if (c.st === 'free') cx.fillRect(x0 + c.x * s - 1, y0 + 2, 3, h - 4); });
+  cx.fillStyle = '#ff7a3a'; cats.forEach(c => cx.fillRect(x0 + c.x * s - 2, y0, 4, h));
+  cx.fillStyle = '#7dbcff'; cx.fillRect(x0 + player.x * s - 2, y0, 4, h);
+  cx.strokeStyle = 'rgba(255,255,255,.5)'; cx.strokeRect(x0 + camX * s, y0, VW * s, h);
+}
+function drawHUD() {
+  for (let i = 0; i < 3; i++) {
+    const x = 20 + i * 26;
+    poly([[x, 22], [x + 10, 10], [x + 20, 22], [x + 10, 34]], i < player.hp ? '#ff4d6d' : '#4a2a5a');
+  }
+  txt('SAVED ' + delivered + '/' + SPAWN_PLATS.length, VW / 2, 30, 20, '#fff3a0');
+  txt('TIME ' + Math.ceil(timeLeft), VW - 20, 30, 20, timeLeft < 15 ? '#ff6b6b' : '#fff3a0', 'right');
+  txt('SCORE ' + score, VW - 20, 54, 14, '#ffffff', 'right');
+  drawRadar();
+  if (state === 'play' && hintT > 0) txt('GRAB CHICKS  >  RUN TO EXIT  >  DODGE CATS', VW / 2, 436, 15, '#ffffff');
+}
+function overlay(t, lines, prompt) {
+  cx.fillStyle = 'rgba(20,9,46,.72)'; cx.fillRect(0, 0, VW, VH);
+  txt(lines.title, VW / 2, 150, 54, '#ffd23a');
+  lines.rows.forEach((r, i) => txt(r, VW / 2, 205 + i * 30, 20, '#ffffff'));
+  if (Math.sin(t * 5) > -0.3) txt(prompt, VW / 2, 390, 20, '#7dbcff');
+}
+
+function draw(t) {
+  cx.save();
+  cx.translate(-Math.round(camX), 0);
+  cx.drawImage(bg, 0, 0);
+  drawDoor(t);
+  PLATS.forEach(drawPlat);
+  chicks.filter(c => c.st === 'free').forEach(c => at(c, c.dir, drawChick));
+  chicks.filter(c => c.st === 'follow').forEach(c => at(c, c.dir, drawChick));
+  cats.forEach(c => {
+    at(c, c.dir, drawCat);
+    if (c.alert > 0) txt('!', c.x, c.y - 34, 24, '#ff4d6d');
+  });
+  if (!(player.inv > 0 && Math.floor(t * 12) % 2)) at(player, player.face, drawBird);
+  cx.restore();
+  drawHUD();
+  if (state === 'ready') {
+    overlay(t, { title: 'CHIRP CHASE', rows: ['GRAB THE LOST CHICKS', 'LEAD THEM TO THE EXIT', 'DODGE THE CATS', '', 'ARROWS / WASD MOVE    SPACE JUMP'] },
+      'PRESS ANY KEY OR TAP TO START');
+  } else if (state === 'won' || state === 'over') {
+    overlay(t, { title: msg, rows: ['SCORE ' + score, 'BEST ' + best] },
+      lockT > 0 ? '' : 'PRESS ANY KEY OR TAP TO PLAY AGAIN');
+  }
+}
+
+// ---------- main loop ----------
+let last = 0, acc = 0;
+function loop(ts) {
+  const dt = Math.min(0.1, (ts - last) / 1000 || 0); last = ts;
+  acc += dt; while (acc >= STEP) { step(STEP); acc -= STEP; }
+  lockT = Math.max(0, lockT - dt);
+  draw(ts / 1000);
+  requestAnimationFrame(loop);
+}
+reset();
+requestAnimationFrame(loop);
+})();
+</script>
+</body>
+</html>
